@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>Inclinometer</title>
+<style>
+  @font-face {
+    font-family: 'Sui Generis';
+    src: url('SuiGenerisRg-Regular.ttf.woff') format('woff');
+    font-weight: 400;
+    font-display: swap;
+  }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body {
+    position: fixed; inset: 0;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: system-ui, sans-serif;
+  }
+  canvas { display: block; }
+
+  #calib, #calib2 {
+    position: fixed;
+    width: 54px; height: 54px;
+    border-radius: 50%;
+    background: #111; color: #fff;
+    border: 1px solid #333;
+    touch-action: manipulation;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  #calib.flash, #calib2.flash { border-color: #f5a623; }
+  #calib.holding, #calib2.holding { animation: holdPulse 1s linear infinite; }
+  @keyframes holdPulse {
+    0%, 100% { border-color: #333; }
+    50% { border-color: #f5a623; box-shadow: 0 0 8px #f5a623; }
+  }
+  @media (orientation: portrait) {
+    #calib {
+      right: max(14px, env(safe-area-inset-right));
+      bottom: max(14px, env(safe-area-inset-bottom));
+    }
+    #calib2 {
+      right: max(14px, env(safe-area-inset-right));
+      top: max(14px, env(safe-area-inset-top));
+    }
+  }
+  @media (orientation: landscape) {
+    #calib {
+      left: max(14px, env(safe-area-inset-left));
+      bottom: max(14px, env(safe-area-inset-bottom));
+    }
+    #calib2 {
+      right: max(14px, env(safe-area-inset-right));
+      bottom: max(14px, env(safe-area-inset-bottom));
+    }
+  }
+
+  #warn {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    text-align: center;
+    color: #f5a623;
+    font-size: 11px;
+    letter-spacing: 1px;
+    pointer-events: none;
+  }
+
+  #start {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px;
+    background: rgba(0,0,0,.88);
+    z-index: 10;
+  }
+  #start.hidden { display: none; }
+  #denied {
+    color: #f5a623;
+    font-size: 13px;
+    letter-spacing: .5px;
+    max-width: 80vw;
+    text-align: center;
+  }
+  #denied.hidden { display: none; }
+  #start button {
+    background: #1a1a1a; color: #fff;
+    border: 1px solid #444; border-radius: 999px;
+    padding: 16px 40px; font-size: 18px; letter-spacing: 2px;
+    touch-action: manipulation;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="calib" title="Calibrate pitch"></button>
+<button id="calib2" title="Calibrate roll"></button>
+<div id="start"><button id="startBtn">Start</button><div id="denied" class="hidden">Sensor access denied. Enable it in your browser settings, then tap Start again.</div></div>
+<div id="warn">&quot;WARNING-ACCURATE ONLY WHEN COMPLETELY STOPPED. DO NOT EXCEED 30 DEGREES.&quot;</div>
+
+<script>
+  const c = document.getElementById('c');
+  const ctx = c.getContext('2d');
+  const calibBtn = document.getElementById('calib');
+  const calibRollBtn = document.getElementById('calib2');
+  const start = document.getElementById('start');
+
+  const DPR = Math.min(window.devicePixelRatio || 1, 3);
+  let W, H, cxP, cyP, cxR, cyR, Ri, Rd, numR, jeepScale, backScale;
+  let dirty = true;
+  let rafPending = false;
+  let bgTile = null, bgTileSize = 0;
+  let focus = null;
+
+  function isLandscape() {
+    return !!(window.matchMedia && matchMedia('(orientation: landscape)').matches);
+  }
+
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    c.width = W * DPR; c.height = H * DPR;
+    c.style.width = W + 'px'; c.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const GUTTER = 40;
+    if (focus) {
+      if (focus === 'pitch') { cxP = W / 2; cyP = H / 2; }
+      else { cxR = W / 2; cyR = H / 2; }
+      Ri = Math.min(Math.min(W, H) * 0.42, Math.min(W, H) / 2 - GUTTER - 6);
+    } else {
+      let maxRi;
+      if (isLandscape()) {
+        cxP = W * 0.30; cyP = H / 2;
+        cxR = W * 0.70; cyR = H / 2;
+        maxRi = Math.min((cxR - cxP) / 2 - GUTTER, cxP - GUTTER, cyP - GUTTER);
+      } else {
+        cxP = W * 0.45; cyP = H * 0.72;
+        cxR = W * 0.45; cyR = H * 0.28;
+        maxRi = Math.min((cyP - cyR) / 2 - GUTTER, cyR - GUTTER, cxP - GUTTER, W - cxP - GUTTER);
+      }
+      Ri = Math.min(Math.min(W, H) * 0.37, maxRi);
+    }
+    Ri = Math.max(Ri, 8);
+    Rd = Ri + 10;
+    numR = Rd + 30;
+    jeepScale = Ri * 0.0131;
+    backScale = jeepScale * 2.05;
+    applyFocusUI();
+    buildTile();
+    dirty = true;
+    schedule();
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+  resize();
+
+  const STORE_KEY = 'incl_calib_v2';
+  let stored = null;
+  try {
+    const s = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (s && typeof s.beta === 'number' && typeof s.gamma === 'number') stored = s;
+  } catch (e) {}
+  const base = stored ? { beta: stored.beta, gamma: stored.gamma } : { beta: 0, gamma: 0 };
+  let autoCalibrated = false;
+
+  function saveCalib() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(base));
+    } catch (e) {}
+  }
+
+  function flashCalib(btn) {
+    btn.classList.add('flash');
+    setTimeout(() => btn.classList.remove('flash'), 300);
+  }
+
+  function wrap(d) {
+    return ((d + 180) % 360 + 360) % 360 - 180;
+  }
+
+  let lastBeta = null, lastGamma = null;
+  let lastAlpha = null;
+  let targetPitch = 0, pitchAngle = 0;
+  let targetRoll = 0, rollAngle = 0;
+  let demoMode = false;
+  let sensorLive = false;
+  let verbose = false;
+
+  const q = new URLSearchParams(location.search);
+  if (q.get('demo') !== null) {
+    demoMode = true;
+    targetPitch = parseFloat(q.get('demo')) || 0;
+  }
+
+  function onOrient(e) {
+    const beta = e.beta, gamma = e.gamma;
+    if (beta == null && gamma == null) return;
+    lastBeta = beta; lastGamma = gamma;
+    lastAlpha = e.alpha;
+    sensorLive = true;
+    if (demoMode) return;
+    if (!autoCalibrated && !stored) {
+      base.beta = (beta == null) ? 0 : beta;
+      base.gamma = (gamma == null) ? 0 : gamma;
+      autoCalibrated = true;
+      saveCalib();
+      flashCalib(calibBtn);
+      flashCalib(calibRollBtn);
+    }
+    const db = wrap(((beta == null) ? 0 : beta) - (base.beta == null ? 0 : base.beta));
+    const dg = wrap(((gamma == null) ? 0 : gamma) - (base.gamma == null ? 0 : base.gamma));
+    if (isLandscape()) {
+      targetPitch = -dg;
+      targetRoll = db;
+    } else {
+      targetPitch = db;
+      targetRoll = dg * 0.5;
+    }
+    dirty = true;
+    schedule();
+  }
+
+  let wakeLock = null;
+
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch (e) {}
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestWakeLock();
+  });
+
+  window.addEventListener('pagehide', () => {
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  });
+
+  async function enableSensor() {
+    requestWakeLock();
+    if (window.DeviceOrientationEvent &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const r = await DeviceOrientationEvent.requestPermission();
+        if (r !== 'granted') {
+          document.getElementById('denied').classList.remove('hidden');
+          return;
+        }
+      } catch (e) {
+        document.getElementById('denied').classList.remove('hidden');
+        return;
+      }
+    }
+    window.addEventListener('deviceorientation', onOrient);
+    start.classList.add('hidden');
+  }
+
+  document.getElementById('startBtn').addEventListener('click', enableSensor);
+
+  if (!(window.DeviceOrientationEvent &&
+        typeof DeviceOrientationEvent.requestPermission === 'function')) {
+    requestWakeLock();
+    window.addEventListener('deviceorientation', onOrient);
+    start.classList.add('hidden');
+  }
+
+  function toggleVerbose() {
+    verbose = !verbose;
+    dirty = true;
+    schedule();
+  }
+
+  function attachHold(btn, onTap, onHold) {
+    let timer = null, held = false;
+    btn.addEventListener('pointerdown', () => {
+      held = false;
+      btn.classList.add('holding');
+      timer = setTimeout(() => {
+        held = true;
+        onHold();
+      }, 5000);
+    });
+    btn.addEventListener('pointerup', () => {
+      btn.classList.remove('holding');
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (held) { held = false; return; }
+      onTap();
+    });
+    btn.addEventListener('pointercancel', () => {
+      btn.classList.remove('holding');
+      if (timer) { clearTimeout(timer); timer = null; }
+      held = false;
+    });
+    btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  function goFullscreen() {
+    if (document.fullscreenElement) return;
+    const el = document.documentElement;
+    const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (fn) fn.call(el);
+  }
+
+  attachHold(calibBtn, () => {
+    if (isLandscape()) base.gamma = (lastGamma == null) ? 0 : lastGamma;
+    else base.beta = (lastBeta == null) ? 0 : lastBeta;
+    targetPitch = 0; pitchAngle = 0;
+    saveCalib();
+    flashCalib(calibBtn);
+    goFullscreen();
+    dirty = true;
+    schedule();
+  }, toggleVerbose);
+
+  attachHold(calibRollBtn, () => {
+    if (isLandscape()) base.beta = (lastBeta == null) ? 0 : lastBeta;
+    else base.gamma = (lastGamma == null) ? 0 : lastGamma;
+    targetRoll = 0; rollAngle = 0;
+    saveCalib();
+    flashCalib(calibRollBtn);
+    goFullscreen();
+    dirty = true;
+    schedule();
+  }, toggleVerbose);
+
+  function applyFocusUI() {
+    calibBtn.style.display = (focus === 'pitch' || !focus) ? '' : 'none';
+    calibRollBtn.style.display = (focus === 'roll' || !focus) ? '' : 'none';
+  }
+
+  function dialHit(x, y, cx, cy) {
+    const dx = x - cx, dy = y - cy;
+    return Math.sqrt(dx * dx + dy * dy) <= Rd + 14;
+  }
+
+  c.addEventListener('pointerup', (e) => {
+    const rect = c.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const prev = focus;
+    if (focus) {
+      if (dialHit(x, y, focus === 'pitch' ? cxP : cxR, focus === 'pitch' ? cyP : cyR)) focus = null;
+    } else {
+      if (dialHit(x, y, cxP, cyP)) focus = 'pitch';
+      else if (dialHit(x, y, cxR, cyR)) focus = 'roll';
+    }
+    if (focus === prev) return;
+    resize();
+    dirty = true;
+    schedule();
+  });
+
+  function pt(cx, cy, r, deg) {
+    const rad = -deg * Math.PI / 180;
+    return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+  }
+
+  function drawDial(g, cx, cy) {
+    for (let k = -30; k <= 30; k += 5) {
+      const a = pt(cx, cy, Rd, k), b = pt(cx, cy, Rd + 12, k);
+      g.strokeStyle = (k === 0) ? '#d9ffd9' : '#555';
+      g.lineWidth = (k % 10 === 0) ? 2.5 : 1.5;
+      g.beginPath();
+      g.moveTo(a.x, a.y);
+      g.lineTo(b.x, b.y);
+      g.stroke();
+    }
+
+    g.fillStyle = '#ffffff';
+    g.globalAlpha = 1;
+    g.font = Math.round(Ri * 0.13) + 'px "Sui Generis", system-ui, sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    for (let k = -30; k <= 30; k += 10) {
+      const p = pt(cx, cy, numR, -k);
+      g.fillStyle = (k === 0) ? '#d9ffd9' : '#ffffff';
+      g.fillText(Math.abs(k), p.x, p.y);
+    }
+  }
+
+  function drawPlate(g, cx, cy) {
+    g.fillStyle = '#0d0d0d';
+    g.beginPath();
+    g.arc(cx, cy, Ri, 0, Math.PI * 2);
+    g.fill();
+    g.strokeStyle = '#2a2a2a';
+    g.lineWidth = 2;
+    g.stroke();
+  }
+
+  function buildTile() {
+    const pad = Math.ceil(Math.max(6, Ri * 0.18));
+    bgTileSize = Math.ceil((numR + pad) * 2);
+    bgTile = document.createElement('canvas');
+    bgTile.width = Math.ceil(bgTileSize * DPR);
+    bgTile.height = Math.ceil(bgTileSize * DPR);
+    const g = bgTile.getContext('2d');
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    g.translate(bgTileSize / 2, bgTileSize / 2);
+    drawDial(g, 0, 0);
+    drawPlate(g, 0, 0);
+  }
+
+  function tracePath(pts, close) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) {
+      const p = pts[i];
+      if (p.length === 2) ctx.lineTo(p[0], p[1]);
+      else ctx.bezierCurveTo(p[0], p[1], p[2], p[3], p[4], p[5]);
+    }
+    if (close) ctx.closePath();
+  }
+
+  function drawJeep(cx, cy, angle) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle * Math.PI / 180);
+
+    const half = 54.9 * jeepScale;
+    ctx.strokeStyle = '#d9ffd9';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-Ri, 0);
+    ctx.lineTo(-half, 0);
+    ctx.moveTo(half, 0);
+    ctx.lineTo(Ri, 0);
+    ctx.stroke();
+
+    ctx.scale(jeepScale, jeepScale);
+    ctx.translate(0, -5);
+
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    const wheel = (x, y) => {
+      ctx.beginPath();
+      ctx.ellipse(x, y, 9.93, 9.52, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    };
+    wheel(-32.4, 20.0);
+    wheel(29.9, 20.2);
+
+    const body = [
+      [-42.7, 19.6], [-52.4, 18.0], [-54.9, 12.9], [-54.9, 11.2],
+      [-50.3, 3.2], [-24.8, -0.4], [-6.8, -19.0], [21.5, -19.3],
+      [46.6, -18.7], [48.0, -17.6], [51.9, -5.3], [54.5, 6.7],
+      [54.9, 11.5], [51.5, 18.2], [43.7, 19.7], [40.0, 20.0]
+    ];
+    ctx.beginPath();
+    ctx.moveTo(body[0][0], body[0][1]);
+    for (let i = 1; i < body.length; i++) ctx.lineTo(body[i][0], body[i][1]);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(-22.1, 20.7);
+    ctx.lineTo(19.9, 20.7);
+    ctx.stroke();
+
+    const fwin = [[-18.7, -0.8], [-5.5, -15.2], [15.5, -15.2], [13.0, -0.5]];
+    ctx.beginPath();
+    ctx.moveTo(fwin[0][0], fwin[0][1]);
+    for (let i = 1; i < fwin.length; i++) ctx.lineTo(fwin[i][0], fwin[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+
+    const rwin = [[17.4, -0.7], [46.9, -0.7], [43.0, -15.1], [20.1, -15.1]];
+    ctx.beginPath();
+    ctx.moveTo(rwin[0][0], rwin[0][1]);
+    for (let i = 1; i < rwin.length; i++) ctx.lineTo(rwin[i][0], rwin[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  const rearWindow = [[-15.67, -20.49], [15.56, -20.49], [12.47, -30.46], [-12.51, -30.46]];
+  const bodyBottom = [[-15.18, -5.89], [15.21, -5.89]];
+  const rightWheel = [[13.45, -5.89], [13.45, -0.07], [18.37, -0.07], [18.37, -6.24]];
+  const leftWheel = [[-13.22, -6.10], [-13.22, 0.00], [-18.41, 0.00], [-18.41, -6.17]];
+  const leftFender = [[-19.39, -18.17], [-16.30, -18.17], [-17.22, -12.28], [-20.51, -12.28]];
+  const rightFender = [[19.35, -18.53], [15.91, -18.53], [17.17, -12.70], [20.54, -12.70]];
+  const roof = [
+    [-14.34, -32.00],
+    [-13.31, -32.23, -12.28, -32.47, -8.03, -32.58],
+    [-3.79, -32.70, 3.68, -32.70, 7.93, -32.56],
+    [12.19, -32.42, 13.24, -32.14, 14.30, -31.86]
+  ];
+  const rightBodySide = [
+    [18.23, -6.03],
+    [19.04, -7.32, 19.86, -8.61, 20.30, -9.85],
+    [20.73, -11.09, 20.78, -12.28, 20.58, -13.86],
+    [20.38, -15.44, 19.93, -17.40, 18.94, -20.40],
+    [17.95, -23.39, 16.40, -27.41, 15.47, -29.52],
+    [14.53, -31.63, 14.20, -31.81, 13.87, -32.00]
+  ];
+  const leftBodySide = [
+    [-18.34, -6.09],
+    [-19.16, -7.38, -19.98, -8.67, -20.41, -9.91],
+    [-20.84, -11.15, -20.89, -12.34, -20.69, -13.92],
+    [-20.49, -15.50, -20.05, -17.46, -19.05, -20.46],
+    [-18.06, -23.45, -16.51, -27.48, -15.58, -29.58],
+    [-14.64, -31.69, -14.31, -31.87, -13.99, -32.06]
+  ];
+  const rearLower = [
+    [-3.25, -5.70],
+    [-4.69, -5.68, -4.00, -5.60, -3.33, -5.23],
+    [-2.66, -4.85, -2.00, -4.18, -1.24, -3.84],
+    [-0.48, -3.50, 0.38, -3.50, 1.25, -3.88],
+    [2.12, -4.25, 3.01, -5.00, 3.70, -5.37],
+    [4.38, -5.73, 4.87, -5.70, 3.32, -5.70],
+    [1.78, -5.70, -1.80, -5.73, -3.25, -5.70]
+  ];
+
+  function drawBack(cx, cy, angle) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle * Math.PI / 180);
+
+    const half = 20.5 * backScale;
+    ctx.strokeStyle = '#d9ffd9';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-Ri, 0);
+    ctx.lineTo(-half, 0);
+    ctx.moveTo(half, 0);
+    ctx.lineTo(Ri, 0);
+    ctx.stroke();
+
+    ctx.scale(backScale, backScale);
+    ctx.translate(0, 16);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    tracePath(rearWindow, true); ctx.stroke();
+    tracePath(bodyBottom, false); ctx.stroke();
+    tracePath(rightWheel, false); ctx.stroke();
+    tracePath(leftWheel, false); ctx.stroke();
+    tracePath(leftFender, false); ctx.stroke();
+    tracePath(rightFender, false); ctx.stroke();
+    tracePath(roof, false); ctx.stroke();
+    tracePath(rightBodySide, false); ctx.stroke();
+    tracePath(leftBodySide, false); ctx.stroke();
+    ctx.fillStyle = '#fff';
+    tracePath(rearLower, true); ctx.fill();
+
+    ctx.restore();
+  }
+
+  function schedule() {
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(draw);
+    }
+  }
+
+  function draw() {
+    rafPending = false;
+    const dp = targetPitch - pitchAngle;
+    const dr = targetRoll - rollAngle;
+    const moving = Math.abs(dp) > 0.02 || Math.abs(dr) > 0.02;
+    if (!dirty && !moving) return;
+    dirty = false;
+    pitchAngle += dp * 0.12;
+    rollAngle += dr * 0.12;
+    if (Math.abs(targetPitch - pitchAngle) < 0.02) pitchAngle = targetPitch;
+    if (Math.abs(targetRoll - rollAngle) < 0.02) rollAngle = targetRoll;
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    const half = bgTileSize / 2;
+    if (focus !== 'roll') {
+      ctx.drawImage(bgTile, cxP - half, cyP - half, bgTileSize, bgTileSize);
+      drawJeep(cxP, cyP, pitchAngle);
+    }
+
+    if (focus !== 'pitch') {
+      ctx.drawImage(bgTile, cxR - half, cyR - half, bgTileSize, bgTileSize);
+      drawBack(cxR, cyR, rollAngle);
+    }
+
+    if (verbose) {
+      const fmt = (v) => v == null ? '--' : v.toFixed(1);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = Math.round(Ri * 0.13) + 'px "Sui Generis", system-ui, sans-serif';
+      ctx.fillStyle = '#f5a623';
+      ctx.fillText('PITCH ' + pitchAngle.toFixed(1) + '\u00b0', cxP, cyP + Ri * 0.6);
+      ctx.fillText('ROLL ' + rollAngle.toFixed(1) + '\u00b0', cxR, cyR + Ri * 0.6);
+      ctx.fillStyle = '#777';
+      ctx.font = Math.round(Math.min(Ri * 0.12, 14)) + 'px "Sui Generis", system-ui, sans-serif';
+      ctx.fillText('RAW  a ' + fmt(lastAlpha) + '  b ' + fmt(lastBeta) + '  g ' + fmt(lastGamma),
+        W / 2, focus ? (H - 30) : (isLandscape() ? 22 : (cyR - numR - 16)));
+    }
+
+    if (moving) schedule();
+  }
+  schedule();
+</script>
+</body>
+</html>
