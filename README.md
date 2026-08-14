@@ -1,6 +1,8 @@
 # A nostalgic recreation of the 1980 Toyota Tercel Inclinometer
 Web based inclinometer for phone or car dash.
 
+![Screenshot](/screenshot.png)
+
 [Demo](https://falkp.no/incl/)
 
 ## The original
